@@ -35,6 +35,9 @@ services:
       - PYTHONUNBUFFERED=1
       - LONGBOW_DATA_URI=grpc://longbow:3000
       - LONGBOW_META_URI=grpc://longbow:3001
+      - MEMORY_SIDECAR_PATH=/app/data/memory_sidecar.json
+    volumes:
+      - sidecar_data:/app/data
     depends_on:
       - longbow
     # Wait for Longbow to be ready before connecting
@@ -62,6 +65,9 @@ services:
       - LONGBOW_DATA_URI=grpc://longbow:3000
       - LONGBOW_META_URI=grpc://longbow:3001
       - MCP_SSE_PORT=8765
+      - MEMORY_SIDECAR_PATH=/app/data/memory_sidecar.json
+    volumes:
+      - sidecar_data:/app/data
     depends_on:
       - longbow
     restart: on-failure
@@ -93,4 +99,6 @@ networks:
 
 volumes:
   longbow_data:
+    driver: local
+  sidecar_data:
     driver: local

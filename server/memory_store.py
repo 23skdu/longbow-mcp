@@ -1,12 +1,20 @@
-"""Vector memory storage using Longbow distributed vector database (SDK)."""
+"""Vector memory storage using Longbow vector index + JSON metadata sidecar.
+
+Longbow is a pure HNSW vector index — it stores vectors and returns integer IDs.
+String columns (id, metadata) are not persisted by Longbow. We maintain a local
+JSON sidecar file that maps Longbow integer indices to full Memory objects.
+"""
 import json
 import os
 import time
 import uuid
+import threading
 from datetime import datetime
 from typing import List, Optional, Dict, Any
+from pathlib import Path
 import logging
 
+import numpy as np
 import pandas as pd
 from sentence_transformers import SentenceTransformer
 from longbow import LongbowClient
@@ -16,14 +24,90 @@ from models import Memory, SearchResult
 
 logger = logging.getLogger(__name__)
 
+# Sidecar file path — writable directory inside Docker container
+SIDECAR_PATH = os.getenv("MEMORY_SIDECAR_PATH", "/app/data/memory_sidecar.json")
+
 
 def _uuid_to_graph_id(uuid_str: str) -> int:
     """Map a UUID string to an int64 graph node ID for Longbow graph operations."""
     return abs(hash(uuid_str)) % (2**53)
 
 
+class MetadataSidecar:
+    """Thread-safe JSON sidecar for memory metadata.
+
+    Stores a mapping of { memory_uuid: { content, client_id, created_at, metadata, longbow_idx } }.
+    Also tracks next_index to assign sequential Longbow integer IDs.
+    """
+
+    def __init__(self, path: str = SIDECAR_PATH):
+        self._path = Path(path)
+        self._lock = threading.Lock()
+        self._data: Dict[str, Any] = {"memories": {}, "next_index": 0}
+        self._load()
+
+    def _load(self):
+        """Load sidecar from disk if it exists."""
+        if self._path.exists():
+            try:
+                with open(self._path, "r") as f:
+                    self._data = json.load(f)
+                logger.info(f"Loaded {len(self._data.get('memories', {}))} memories from sidecar")
+            except (json.JSONDecodeError, OSError) as e:
+                logger.warning(f"Failed to load sidecar ({e}), starting fresh")
+                self._data = {"memories": {}, "next_index": 0}
+
+    def _save(self):
+        """Persist sidecar to disk."""
+        self._path.parent.mkdir(parents=True, exist_ok=True)
+        with open(self._path, "w") as f:
+            json.dump(self._data, f)
+
+    def add(self, memory_id: str, content: str, client_id: str,
+            created_at: str, metadata: Dict, embedding: List[float]) -> int:
+        """Add a memory and return its Longbow integer index."""
+        with self._lock:
+            idx = self._data["next_index"]
+            self._data["memories"][memory_id] = {
+                "longbow_idx": idx,
+                "content": content,
+                "client_id": client_id,
+                "created_at": created_at,
+                "metadata": metadata,
+            }
+            self._data["next_index"] = idx + 1
+            self._save()
+            return idx
+
+    def get(self, memory_id: str) -> Optional[Dict]:
+        """Get memory metadata by UUID."""
+        return self._data.get("memories", {}).get(memory_id)
+
+    def get_by_longbow_idx(self, idx: int) -> Optional[tuple[str, Dict]]:
+        """Get (uuid, metadata) by Longbow integer index."""
+        for mid, meta in self._data.get("memories", {}).items():
+            if meta.get("longbow_idx") == idx:
+                return mid, meta
+        return None
+
+    def all_memories(self) -> Dict[str, Dict]:
+        """Return all memories."""
+        return dict(self._data.get("memories", {}))
+
+    def count(self) -> int:
+        return len(self._data.get("memories", {}))
+
+    def clear(self) -> int:
+        """Clear all memories, return count deleted."""
+        with self._lock:
+            count = len(self._data.get("memories", {}))
+            self._data = {"memories": {}, "next_index": 0}
+            self._save()
+            return count
+
+
 class MemoryStore:
-    """Longbow SDK-backed vector memory store."""
+    """Longbow SDK-backed vector memory store with metadata sidecar."""
 
     NAMESPACE = "mcp_memories"
     EMBEDDING_DIM = 384  # all-MiniLM-L6-v2
@@ -38,6 +122,7 @@ class MemoryStore:
 
         self._model: Optional[SentenceTransformer] = None
         self._client: Optional[LongbowClient] = None
+        self._sidecar = MetadataSidecar()
         self._initialized = False
 
     def _get_model(self) -> SentenceTransformer:
@@ -59,7 +144,6 @@ class MemoryStore:
                         meta_uri=self.longbow_meta_uri,
                     )
                     client.connect()
-                    # Test connection by listing namespaces
                     client.list_namespaces()
                     self._client = client
                     logger.info("Connected to Longbow via SDK")
@@ -71,106 +155,61 @@ class MemoryStore:
                     else:
                         raise ConnectionError(f"Failed to connect to Longbow after {max_retries} attempts: {e}")
 
-            # Ensure namespace exists
             if not self._initialized:
                 try:
                     self._client.create_namespace(self.NAMESPACE)
                 except Exception:
-                    pass  # Namespace may already exist
+                    pass
                 self._initialized = True
 
         return self._client
 
-    def _record_to_memory(self, record: Dict[str, Any]) -> Memory:
-        """Convert a raw Longbow record dict to a Memory object."""
-        meta = record.get("metadata", {})
-        if isinstance(meta, str):
-            meta = json.loads(meta) if meta else {}
+    def _sidecar_to_memory(self, memory_id: str, meta: Dict, embedding: List[float] = None) -> Memory:
+        """Convert sidecar entry to Memory object."""
         return Memory(
-            id=str(record["id"]),
+            id=memory_id,
             content=meta.get("content", ""),
-            embedding=record.get("vector"),
-            metadata={k: v for k, v in meta.items() if k not in ("content", "client_id", "created_at")},
+            embedding=embedding,
+            metadata=meta.get("metadata", {}),
             created_at=datetime.fromisoformat(meta.get("created_at", datetime.utcnow().isoformat())),
             client_id=meta.get("client_id", "unknown"),
         )
 
-    def _df_to_search_results(self, df: pd.DataFrame) -> List[SearchResult]:
-        """Convert SDK search DataFrame to list of SearchResult."""
-        if df is None or df.empty:
-            return []
-
-        # Need full records to reconstruct Memory objects — download all and index by ID
-        client = self._get_client()
-        try:
-            all_table = client.download_arrow(self.NAMESPACE)
-            all_df = all_table.to_pandas()
-        except Exception:
-            all_df = pd.DataFrame()
-
-        # Build lookup maps
-        records_by_id = {}
-        records_by_index = {}
-        if not all_df.empty:
-            for idx, row in all_df.iterrows():
-                record = {
-                    "id": str(row.get("id", idx)),
-                    "vector": row.get("vector"),
-                    "metadata": row.get("metadata", "{}"),
-                }
-                records_by_id[record["id"]] = record
-                records_by_index[idx] = record
-
-        results = []
-        for _, row in df.iterrows():
-            raw_id = str(row.get("id", ""))
-            score = float(row.get("score", row.get("distance", 0.0)))
-            # Convert distance to similarity if needed
-            if "distance" in df.columns and "score" not in df.columns:
-                score = 1.0 / (1.0 + score)
-
-            record = records_by_id.get(raw_id)
-            if record is None and raw_id.lstrip('-').isdigit():
-                record = records_by_index.get(int(raw_id))
-
-            if record:
-                memory = self._record_to_memory(record)
-                results.append(SearchResult(memory=memory, score=score))
-            else:
-                logger.warning(f"Could not find record for search result ID: {raw_id}")
-
-        return results
-
     def add_memory(self, content: str, client_id: str, metadata: Dict = None) -> Memory:
         """Add a new memory with embedding."""
         model = self._get_model()
-        embedding = model.encode(content).tolist()
+        embedding = model.encode(content)  # numpy float32 array
 
-        memory = Memory(
-            id=str(uuid.uuid4()),
+        memory_id = str(uuid.uuid4())
+        created_at = datetime.utcnow().isoformat()
+
+        # Store metadata in sidecar, get Longbow integer index
+        longbow_idx = self._sidecar.add(
+            memory_id=memory_id,
             content=content,
-            embedding=embedding,
-            metadata=metadata or {},
-            created_at=datetime.utcnow(),
             client_id=client_id,
+            created_at=created_at,
+            metadata=metadata or {},
+            embedding=embedding.tolist(),
         )
 
-        # Build DataFrame for SDK insert
-        df = pd.DataFrame([{
-            "id": memory.id,
-            "vector": embedding,
-            "metadata": json.dumps({
-                "content": content,
-                "client_id": client_id,
-                "created_at": memory.created_at.isoformat(),
-                **(metadata or {}),
-            }),
-            "timestamp": memory.created_at.isoformat(),
-        }])
+        # Store vector in Longbow with integer ID
+        df = pd.DataFrame({
+            "id": pd.array([longbow_idx], dtype="int64"),
+            "vector": [np.asarray(embedding, dtype=np.float32)],
+        })
 
         client = self._get_client()
         client.insert(self.NAMESPACE, df)
-        return memory
+
+        return Memory(
+            id=memory_id,
+            content=content,
+            embedding=embedding.tolist(),
+            metadata=metadata or {},
+            created_at=datetime.fromisoformat(created_at),
+            client_id=client_id,
+        )
 
     def search(self, query: str, top_k: int = 5) -> List[SearchResult]:
         """Semantic search using vector similarity (KNN)."""
@@ -184,7 +223,7 @@ class MemoryStore:
             logger.error(f"Search failed: {e}")
             return []
 
-        return self._df_to_search_results(result_df)
+        return self._search_df_to_results(result_df)
 
     def hybrid_search(self, query: str, top_k: int = 5, alpha: float = 0.5) -> List[SearchResult]:
         """Hybrid vector+text search with alpha blending."""
@@ -201,37 +240,36 @@ class MemoryStore:
             logger.error(f"Hybrid search failed: {e}")
             return []
 
-        return self._df_to_search_results(result_df)
+        return self._search_df_to_results(result_df)
 
     def search_by_id(self, memory_id: str, top_k: int = 5) -> List[SearchResult]:
         """Find memories similar to an existing memory by ID."""
+        # Look up the Longbow integer index from sidecar
+        meta = self._sidecar.get(memory_id)
+        if not meta:
+            logger.warning(f"Memory {memory_id} not found in sidecar")
+            return []
+
+        longbow_idx = meta.get("longbow_idx")
         client = self._get_client()
         try:
-            raw = client.search_by_id(self.NAMESPACE, memory_id, k=top_k)
+            raw = client.search_by_id(self.NAMESPACE, longbow_idx, k=top_k)
         except LongbowQueryError as e:
             logger.error(f"Search by ID failed: {e}")
             return []
 
-        # raw is a dict with results — convert to list of SearchResult
         if not raw:
             return []
 
-        # The SDK returns a dict; extract results list
         raw_results = raw.get("results", [])
-        if not raw_results:
-            return []
-
-        # Need full records for Memory objects
-        all_records = self._download_all_records()
-        records_by_id = {r["id"]: r for r in all_records}
-
         results = []
         for item in raw_results:
-            rid = str(item.get("id", ""))
+            idx = int(item.get("id", -1))
             score = float(item.get("score", 0.0))
-            record = records_by_id.get(rid)
-            if record:
-                memory = self._record_to_memory(record)
+            entry = self._sidecar.get_by_longbow_idx(idx)
+            if entry:
+                mid, emeta = entry
+                memory = self._sidecar_to_memory(mid, emeta)
                 results.append(SearchResult(memory=memory, score=score))
 
         return results
@@ -251,63 +289,49 @@ class MemoryStore:
             logger.error(f"Filtered search failed: {e}")
             return []
 
-        return self._df_to_search_results(result_df)
+        return self._search_df_to_results(result_df)
 
     def list_memories(self, limit: int = 50, offset: int = 0) -> tuple[List[Memory], int]:
         """List all memories with pagination."""
-        all_records = self._download_all_records()
-        total = len(all_records)
+        all_mems = self._sidecar.all_memories()
+        total = len(all_mems)
 
         # Sort by created_at descending
-        all_records.sort(
-            key=lambda r: r.get("metadata", {}).get("created_at", "") if isinstance(r.get("metadata"), dict) else "",
+        sorted_items = sorted(
+            all_mems.items(),
+            key=lambda kv: kv[1].get("created_at", ""),
             reverse=True,
         )
 
-        paginated = all_records[offset:offset + limit]
-        memories = [self._record_to_memory(r) for r in paginated]
+        paginated = sorted_items[offset:offset + limit]
+        memories = [self._sidecar_to_memory(mid, meta) for mid, meta in paginated]
         return memories, total
 
     def delete_all(self) -> int:
         """Delete all memories."""
+        count = self._sidecar.clear()
+
+        # Reset Longbow namespace
         client = self._get_client()
-        count = self._get_record_count()
-        client.delete_namespace(self.NAMESPACE)
         try:
-            client.create_namespace(self.NAMESPACE)
+            client.delete_namespace(self.NAMESPACE)
         except Exception:
             pass
+        try:
+            client.create_namespace(self.NAMESPACE, force=True)
+        except Exception:
+            pass
+
         return count
 
     def get_stats(self) -> Dict[str, Any]:
         """Get memory store statistics."""
-        client = self._get_client()
-
-        # Try efficient get_info first
-        try:
-            info = client.get_info(self.NAMESPACE)
-            total = info.get("total_records", -1)
-        except Exception:
-            total = -1
-
-        # If get_info returned -1 (unknown), fall back to download
-        if total < 0:
-            all_records = self._download_all_records()
-            total = len(all_records)
-        else:
-            all_records = None
-
-        # For client/date stats, we need the actual records
-        if all_records is None:
-            all_records = self._download_all_records()
+        all_mems = self._sidecar.all_memories()
 
         clients = set()
         oldest = None
         newest = None
-        for r in all_records:
-            meta = r.get("metadata", {})
-            if isinstance(meta, str):
-                meta = json.loads(meta) if meta else {}
+        for meta in all_mems.values():
             clients.add(meta.get("client_id", "unknown"))
             created = meta.get("created_at")
             if created:
@@ -317,7 +341,7 @@ class MemoryStore:
                     newest = created
 
         return {
-            "total_memories": total if total >= 0 else len(all_records),
+            "total_memories": len(all_mems),
             "unique_clients": len(clients),
             "oldest_memory": oldest,
             "newest_memory": newest,
@@ -360,41 +384,39 @@ class MemoryStore:
 
     # --- Internal helpers ---
 
-    def _download_all_records(self) -> List[Dict[str, Any]]:
-        """Download all records from the namespace as dicts."""
-        client = self._get_client()
-        try:
-            table = client.download_arrow(self.NAMESPACE)
-            df = table.to_pandas()
-        except Exception as e:
-            logger.error(f"Download failed: {e}")
+    def _search_df_to_results(self, df: pd.DataFrame) -> List[SearchResult]:
+        """Convert Longbow search result DataFrame to list of SearchResult.
+
+        Longbow returns integer IDs — map them to Memory objects via sidecar.
+        """
+        if df is None or df.empty:
             return []
 
-        records = []
+        results = []
+        seen_ids: set = set()
         for _, row in df.iterrows():
-            record = {"id": str(row.get("id", ""))}
-            if "vector" in df.columns:
-                record["vector"] = row["vector"]
-            if "metadata" in df.columns:
-                meta_raw = row["metadata"]
-                record["metadata"] = json.loads(meta_raw) if isinstance(meta_raw, str) and meta_raw else (meta_raw if isinstance(meta_raw, dict) else {})
-            if "timestamp" in df.columns:
-                record["timestamp"] = row["timestamp"]
-            records.append(record)
+            # Longbow returns uint64 IDs — convert to int
+            raw_id = row.get("id")
+            try:
+                longbow_idx = int(float(raw_id))  # handle "0.0" string or uint64
+            except (ValueError, TypeError):
+                logger.warning(f"Unparseable search result ID: {raw_id}")
+                continue
 
-        return records
+            score = float(row.get("score", row.get("distance", 0.0)))
+            if "distance" in df.columns and "score" not in df.columns:
+                score = 1.0 / (1.0 + score)
 
-    def _get_record_count(self) -> int:
-        """Get record count, preferring get_info over full download."""
-        client = self._get_client()
-        try:
-            info = client.get_info(self.NAMESPACE)
-            count = info.get("total_records", -1)
-            if count >= 0:
-                return count
-        except Exception:
-            pass
-        return len(self._download_all_records())
+            entry = self._sidecar.get_by_longbow_idx(longbow_idx)
+            if entry:
+                mid, meta = entry
+                if mid in seen_ids:
+                    continue
+                seen_ids.add(mid)
+                memory = self._sidecar_to_memory(mid, meta)
+                results.append(SearchResult(memory=memory, score=score))
+
+        return results
 
 
 # Global store instance
