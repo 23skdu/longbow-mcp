@@ -51,7 +51,7 @@ export function MemoryHUD({
               <Database className="w-5 h-5 text-emerald" />
             </div>
             <div>
-              <h1 className="text-xl font-bold text-white">MCP Memory</h1>
+              <h1 className="text-xl font-bold text-white">Longbow MCP</h1>
               <p className="text-xs text-white/40">Cross-client persistent memory</p>
             </div>
           </div>
