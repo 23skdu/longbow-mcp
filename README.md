@@ -11,38 +11,60 @@ A modern MCP (Model Context Protocol) server with real-time UI for cross-client 
 - **One-Command Deploy**: `docker compose up -d` starts everything
 
 ## Architecture
+```mermaid
+graph TD
+    %% --- Color Definitions for Dark/Light Mode Compatibility ---
+    %% Using a "Nord" style palette for professional, non-clashing look.
+    %% Dark desaturated fills with light text ensures readability on both backgrounds.
 
-```
-┌─────────────────────────────────────────────────────────────┐
-│                      Longbow MCP                            │
-├─────────────────────────────────────────────────────────────┤
-│                                                             │
-│   ┌──────────────┐      ┌──────────────┐                   │
-│   │   MCP stdio  │      │   FastAPI    │                   │
-│   │   Protocol   │◄────►│   + WebSocket │                  │
-│   └──────────────┘      └──────┬───────┘                   │
-│                                │                            │
-│   ┌──────────────┐      ┌─────┴────────┐                   │
-│   │  MCP SSE     │      │  MemoryStore │                   │
-│   │  Transport   │◄────►│  (Longbow)   │                   │
-│   └──────────────┘      └──────────────┘                   │
-│                                │                            │
-│                    ┌───────────┴───────────┐                │
-│                    │  Longbow Vector DB    │                │
-│                    │  Arrow Flight gRPC    │                │
-│                    │  Data:3000 Meta:3001  │                │
-│                    └──────────────────────┘                 │
-└─────────────────────────────────────────────────────────────┘
-                              │
-                              │ WebSocket
-                              ▼
-                    ┌───────────────────┐
-                    │  React + Vite UI  │
-                    │  Three.js Shader  │
-                    │  Bento-Grid HUD   │
-                    └───────────────────┘
-```
+    %% Standard functional nodes (Dark Blue-Gray fill, Light Blue stroke)
+    classDef node_std fill:#3b4252,stroke:#81a1c1,stroke-width:1px,color:#eceff4;
+    
+    %% Container/Subgraph (Transparent fill is safest to adapt to background color, light stroke)
+    classDef container fill:none,stroke:#d8dee9,stroke-width:2px,stroke-dasharray: 5 5,color:#eceff4;
+    
+    %% Database Node (Deeper Gray fill, Cyan stroke)
+    classDef db_node fill:#2e3440,stroke:#88c0d0,stroke-width:2px,color:#eceff4,rx:5,ry:5;
+    
+    %% UI Node (Muted Purple/Gray fill, Purple stroke)
+    classDef ui_node fill:#4c566a,stroke:#b48ead,stroke-width:2px,color:#eceff4;
 
+    %% Ensure connecting lines are light enough to see on dark backgrounds
+    linkStyle default stroke:#d8dee9,stroke-width:2px,fill:none;
+
+
+    %% --- Diagram Structure ---
+    subgraph Longbow_MCP [Longbow MCP]
+        direction TB
+        
+        %% Top Row Components
+        stdio[MCP stdio<br/>Protocol]:::node_std
+        fastapi[FastAPI<br/>+ WebSocket]:::node_std
+        
+        %% Middle Row Components
+        sse[MCP SSE<br/>Transport]:::node_std
+        memory[MemoryStore<br/>Longbow]:::node_std
+        
+        %% Database Component
+        %% Using the cylinder shape [()]
+        vectordb[(Longbow Vector DB<br/>Arrow Flight gRPC<br/>Data:3000 Meta:3001)]:::db_node
+
+        %% Internal Connections
+        stdio <--> fastapi
+        fastapi --> memory
+        sse <--> memory
+        memory --> vectordb
+    end
+
+    %% External Client
+    client[React + Vite UI<br/>Three.js Shader<br/>Bento-Grid HUD]:::ui_node
+
+    %% External Connection using thick arrow ==>
+    fastapi ==>|WebSocket| client
+
+    %% Apply Container Class
+    class Longbow_MCP container
+```
 ## Quick Start
 
 ```bash
